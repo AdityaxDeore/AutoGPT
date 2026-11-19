@@ -3,13 +3,20 @@ import {
   getPostV1CreateExecutionScheduleResponseMock,
 } from "@/app/api/__generated__/endpoints/schedules/schedules.msw";
 import { server } from "@/mocks/mock-server";
+import { useAuthStore } from "@/lib/auth/hooks/useAuthStore";
 import * as invalidateSchedules from "@/services/schedules/invalidate-schedules";
-import { act, renderHook, waitFor } from "@/tests/integrations/test-utils";
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@/tests/integrations/test-utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { NuqsTestingAdapter } from "nuqs/adapters/testing";
-import type { ReactNode } from "react";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import type { ReactElement, ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { useCronSchedulerDialog } from "./useCronSchedulerDialog";
 
 function makeWrapper(searchParams: string) {
@@ -61,6 +68,16 @@ afterEach(() => {
   toastMock.mockClear();
   server.resetHandlers();
   window.sessionStorage.clear();
+});
+
+// The create guard waits for the auth store to settle and hashes the create
+// key with the signed-in user's id, so every create test runs with a user.
+beforeEach(() => {
+  useAuthStore.setState({
+    user: { id: "user-1", email: "user-1@example.com", user_metadata: {} },
+    isUserLoading: false,
+    hasLoadedUser: true,
+  });
 });
 
 describe("useCronSchedulerDialog", () => {
@@ -182,11 +199,94 @@ describe("useCronSchedulerDialog", () => {
       expect(toastMock).toHaveBeenCalledWith(
         expect.objectContaining({ variant: "destructive", description: shown }),
       );
-      expect(toastMock.mock.lastCall?.[0].action !== undefined).toBe(
-        linksToSchedules,
-      );
+      const { action } = toastMock.mock.lastCall?.[0] ?? {};
+      if (linksToSchedules) {
+        expect(action).toBeDefined();
+        const { unmount } = render(action as ReactElement);
+        expect(
+          screen
+            .getByRole("link", { name: "View schedules" })
+            .getAttribute("href"),
+        ).toBe("/library/followups");
+        unmount();
+      } else {
+        expect(action).toBeUndefined();
+      }
     },
   );
+
+  test("an unconfirmed create refreshes the schedule lists too", async () => {
+    server.use(
+      http.post("/api/proxy/api/graphs/:graphId/schedules", () =>
+        HttpResponse.json({ detail: "Service Unavailable" }, { status: 503 }),
+      ),
+    );
+    const invalidateSpy = vi.spyOn(
+      invalidateSchedules,
+      "invalidateAllScheduleQueries",
+    );
+    const { result } = renderFilledDialog();
+
+    await act(async () => {
+      await result.current.handleCreateSchedule().catch(() => undefined);
+    });
+
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        "graph-xyz",
+      );
+    });
+    invalidateSpy.mockRestore();
+  });
+
+  test("a create waits for the auth store to settle, then sends with the signed-in user's key", async () => {
+    // The user has not hydrated yet: nothing may be sent.
+    useAuthStore.setState({
+      user: null,
+      isUserLoading: true,
+      hasLoadedUser: false,
+    });
+    const keys: unknown[] = [];
+    server.use(
+      http.post(
+        "/api/proxy/api/graphs/:graphId/schedules",
+        async ({ request }) => {
+          const body = (await request.json()) as { schedule_id?: unknown };
+          keys.push(body.schedule_id);
+          return HttpResponse.json(
+            getPostV1CreateExecutionScheduleResponseMock(),
+          );
+        },
+      ),
+    );
+    const { result } = renderFilledDialog();
+    let pending: Promise<void> = Promise.resolve();
+    act(() => {
+      pending = result.current.handleCreateSchedule();
+    });
+    // Flush microtasks: the handler parks on the auth store, so no request
+    // can have been sent yet.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(keys).toHaveLength(0);
+    act(() => {
+      useAuthStore.setState({
+        user: { id: "user-1", email: "user-1@example.com", user_metadata: {} },
+        isUserLoading: false,
+        hasLoadedUser: true,
+      });
+    });
+    await act(async () => {
+      await pending;
+    });
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
 
   test("empty cron expression shows destructive toast and skips the mutation", async () => {
     const createScheduleMock = vi.fn();

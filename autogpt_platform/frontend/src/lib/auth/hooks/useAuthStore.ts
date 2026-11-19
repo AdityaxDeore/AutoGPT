@@ -575,6 +575,29 @@ export const useAuthStore = create<AuthStoreState>((set, get) => {
   };
 });
 
+const AUTH_SETTLE_TIMEOUT_MS = 10_000;
+
+// Resolves once the auth store has finished its first load, signed in or
+// not. Never waits for a user id: a failed session load settles with no user,
+// and the create must still go through. The timeout is the backstop for a
+// store that never settles, so a create is delayed, never blocked.
+export function waitForAuthSettled(): Promise<void> {
+  if (!useAuthStore.getState().isUserLoading) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      resolve();
+    }, AUTH_SETTLE_TIMEOUT_MS);
+    const unsubscribe = useAuthStore.subscribe((state) => {
+      if (!state.isUserLoading) {
+        clearTimeout(timer);
+        unsubscribe();
+        resolve();
+      }
+    });
+  });
+}
+
 useAuthStore.subscribe((state, previousState) => {
   // Signing out is reported here; the signed-out state on load once
   // initialize() is done.

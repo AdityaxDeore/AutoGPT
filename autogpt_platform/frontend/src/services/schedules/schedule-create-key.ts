@@ -1,5 +1,5 @@
 import type { ScheduleCreationRequest } from "@/app/api/__generated__/models/scheduleCreationRequest";
-import { ApiError } from "@/lib/autogpt-server-api/helpers";
+import { ApiError } from "@/lib/api-error";
 import { createSafeStorage } from "@/services/storage/safe-storage";
 import { v4 as uuidv4 } from "uuid";
 
@@ -12,6 +12,9 @@ import { v4 as uuidv4 } from "uuid";
 // so a retry after a reload still sends it, a changed create gets a key of its
 // own, and another account signed in to the same tab never inherits it.
 // Where the browser blocks storage it lives in memory, so only until a reload.
+// A key kept after a retryable failure, then abandoned, stays in
+// sessionStorage until the tab closes: there is no TTL, because the retry
+// that needs it may come much later in the same tab.
 
 type StorageKey = `schedule-create:${string}`;
 
@@ -35,6 +38,14 @@ export function withScheduleCreateKey({
   userId,
   create,
 }: Args): ScheduleCreate {
+  // With no user yet, every account in this tab hashes to the same slot, so a
+  // persisted key could be inherited by another account. Mint a fresh key and
+  // store nothing: the dialogs wait for the auth store to settle before they
+  // send, so this only fires when there is no session to bind the key to.
+  if (userId === undefined) {
+    // uuidv4({}) rather than crypto.randomUUID, which is missing on plain HTTP.
+    return { ...create, data: { ...create.data, schedule_id: uuidv4({}) } };
+  }
   const slot = slotFor({ userId, create });
   // uuidv4({}) rather than crypto.randomUUID, which is missing on plain HTTP.
   const key = storage.get(slot) ?? uuidv4({});

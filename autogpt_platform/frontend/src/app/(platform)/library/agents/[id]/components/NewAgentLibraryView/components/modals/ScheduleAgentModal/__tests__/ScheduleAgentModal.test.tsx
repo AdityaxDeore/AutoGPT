@@ -5,10 +5,21 @@ import {
 import type { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
 import type { ScheduleCreationRequest } from "@/app/api/__generated__/models/scheduleCreationRequest";
 import { server } from "@/mocks/mock-server";
+import { useAuthStore } from "@/lib/auth/hooks/useAuthStore";
 import { render, screen, waitFor } from "@/tests/integrations/test-utils";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { ScheduleAgentModal } from "../ScheduleAgentModal";
+
+// The create guard waits for the auth store to settle and hashes the create
+// key with the signed-in user's id, so every create test runs with a user.
+beforeEach(() => {
+  useAuthStore.setState({
+    user: { id: "user-1", email: "user-1@example.com", user_metadata: {} },
+    isUserLoading: false,
+    hasLoadedUser: true,
+  });
+});
 
 const agent = {
   id: "lib-1",

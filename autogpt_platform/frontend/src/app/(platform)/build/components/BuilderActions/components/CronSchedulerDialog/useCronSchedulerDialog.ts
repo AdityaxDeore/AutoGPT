@@ -1,7 +1,10 @@
 import type { ScheduleCreationRequest } from "@/app/api/__generated__/models/scheduleCreationRequest";
 import { usePostV1CreateExecutionSchedule } from "@/app/api/__generated__/endpoints/schedules/schedules";
 import { useToast } from "@/components/molecules/Toast/use-toast";
-import { useAuthStore } from "@/lib/auth/hooks/useAuthStore";
+import {
+  useAuthStore,
+  waitForAuthSettled,
+} from "@/lib/auth/hooks/useAuthStore";
 import { useUserTimezone } from "@/lib/hooks/useUserTimezone";
 import { getTimezoneDisplayName } from "@/lib/timezone-utils";
 import { invalidateAllScheduleQueries } from "@/services/schedules/invalidate-schedules";
@@ -29,7 +32,6 @@ export function useCronSchedulerDialog({
 }) {
   const { toast } = useToast();
   const queryClient = useQueryClient();
-  const userId = useAuthStore((state) => state.user?.id);
   const [cronExpression, setCronExpression] = useState<string>("");
   const [scheduleName, setScheduleName] = useState<string>("");
   const [scheduleNameError, setScheduleNameError] = useState<string>("");
@@ -47,7 +49,10 @@ export function useCronSchedulerDialog({
     usePostV1CreateExecutionSchedule({
       mutation: {
         onSuccess: (response, create) => {
-          forgetScheduleCreateKey({ userId, create });
+          forgetScheduleCreateKey({
+            userId: useAuthStore.getState().user?.id,
+            create,
+          });
           if (response.status === 200) {
             setOpen(false);
             toast({
@@ -58,7 +63,16 @@ export function useCronSchedulerDialog({
           }
         },
         onError: (error, create) => {
-          forgetScheduleCreateKey({ userId, create, error });
+          forgetScheduleCreateKey({
+            userId: useAuthStore.getState().user?.id,
+            create,
+            error,
+          });
+          // The toast sends the user to check their schedules, so refresh the
+          // lists here too: a still-fresh cached list can hide the schedule
+          // the first attempt made. The key is kept for a retry (see
+          // forgetScheduleCreateKey); a 409 or 403 drops it as final.
+          invalidateAllScheduleQueries(queryClient, flowID ?? undefined);
           toast({
             variant: "destructive",
             title: "Failed to create schedule",
@@ -107,6 +121,14 @@ export function useCronSchedulerDialog({
       });
       return;
     }
+
+    // Don't send before the signed-in user's id has loaded: the key is hashed
+    // with it, and a create sent while it is undefined, then retried after
+    // it, uses another slot and can make a second schedule. This waits for
+    // loading to settle, not for an id — a failed session load settles with
+    // no user, and the create still goes through.
+    await waitForAuthSettled();
+    const userId = useAuthStore.getState().user?.id;
 
     await createSchedule(
       withScheduleCreateKey({

@@ -1,11 +1,12 @@
 import { getPostV1CreateExecutionScheduleResponseMock } from "@/app/api/__generated__/endpoints/schedules/schedules.msw";
 import type { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
 import { Toaster } from "@/components/molecules/Toast/toaster";
+import { useAuthStore } from "@/lib/auth/hooks/useAuthStore";
 import { server } from "@/mocks/mock-server";
 import { render, screen, waitFor } from "@/tests/integrations/test-utils";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ScheduleAgentModal } from "../ScheduleAgentModal";
 
 const agent = {
@@ -22,6 +23,16 @@ const UUID_V4 =
 afterEach(() => {
   window.sessionStorage.clear();
   vi.unstubAllGlobals();
+});
+
+// The create guard waits for the auth store to settle and hashes the create
+// key with the signed-in user's id, so every create test runs with a user.
+beforeEach(() => {
+  useAuthStore.setState({
+    user: { id: "user-1", email: "user-1@example.com", user_metadata: {} },
+    isUserLoading: false,
+    hasLoadedUser: true,
+  });
 });
 
 const NO_ANSWER = 0;
@@ -93,6 +104,16 @@ function sessionStorageValues() {
 // Until the last create's success is handled, which drops its key, so the
 // test leaves nothing in flight.
 async function waitForSuccess(keys: unknown[]) {
+  // The key must be a real key, and the success must be observed, before its
+  // removal means anything: otherwise the wait passes vacuously when nothing
+  // was ever stored.
+  expect(keys.at(-1)).toMatch(UUID_V4);
+  // A success toast must be observed: the wait below passes vacuously when
+  // nothing was ever stored, and a second success in the same test leaves
+  // two toasts up, so this reads all of them.
+  expect(
+    (await screen.findAllByText("Schedule created")).length,
+  ).toBeGreaterThan(0);
   await waitFor(() =>
     expect(sessionStorageValues()).not.toContain(keys.at(-1)),
   );
@@ -108,7 +129,40 @@ describe("ScheduleAgentModal retried creates (#16901)", () => {
     // A reload keeps sessionStorage, and nothing the page held in memory.
     expect(sessionStorageValues()).toContain(keys[0]);
     firstTab.unmount();
-    renderModal();
+
+    // A real reload: a fresh module registry, with only sessionStorage kept.
+    // The in-memory storage overlay from the first tab is gone with it.
+    vi.resetModules();
+    const { useAuthStore: freshAuthStore } = await import(
+      "@/lib/auth/hooks/useAuthStore"
+    );
+    freshAuthStore.setState({
+      user: { id: "user-1", email: "user-1@example.com", user_metadata: {} },
+      isUserLoading: false,
+      hasLoadedUser: true,
+    });
+    const { render: freshRender } = await import(
+      "@/tests/integrations/test-utils"
+    );
+    const { ScheduleAgentModal: FreshScheduleAgentModal } = await import(
+      "../ScheduleAgentModal"
+    );
+    const { Toaster: FreshToaster } = await import(
+      "@/components/molecules/Toast/toaster"
+    );
+    freshRender(
+      <>
+        <FreshScheduleAgentModal
+          isOpen
+          onClose={vi.fn()}
+          agent={agent}
+          inputValues={{ topic: "news" }}
+          inputCredentials={{}}
+        />
+        <FreshToaster />
+      </>,
+    );
+
     await clickSchedule(user, keys);
     await clickSchedule(user, keys);
     await waitForSuccess(keys);
@@ -138,6 +192,19 @@ describe("ScheduleAgentModal retried creates (#16901)", () => {
       expect(keys[1]).not.toBe(keys[0]);
     },
   );
+
+  test("a 400 keeps the create key, so the retry sends the same one", async () => {
+    const user = userEvent.setup();
+    const keys = answerCreates([400]);
+    renderModal();
+
+    await clickSchedule(user, keys);
+    await clickSchedule(user, keys);
+    await waitForSuccess(keys);
+
+    expect(keys[0]).toMatch(UUID_V4);
+    expect(keys[1]).toBe(keys[0]);
+  });
 
   test("keys are made where crypto.randomUUID is missing, as on a self-hosted install served over plain HTTP", async () => {
     const real = globalThis.crypto;

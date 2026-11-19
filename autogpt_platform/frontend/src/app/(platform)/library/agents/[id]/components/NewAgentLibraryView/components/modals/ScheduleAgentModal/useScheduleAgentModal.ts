@@ -2,7 +2,10 @@ import { usePostV1CreateExecutionSchedule as useCreateSchedule } from "@/app/api
 import { GraphExecutionJobInfo } from "@/app/api/__generated__/models/graphExecutionJobInfo";
 import { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
 import { useToast } from "@/components/molecules/Toast/use-toast";
-import { useAuthStore } from "@/lib/auth/hooks/useAuthStore";
+import {
+  useAuthStore,
+  waitForAuthSettled,
+} from "@/lib/auth/hooks/useAuthStore";
 import { invalidateAllScheduleQueries } from "@/services/schedules/invalidate-schedules";
 import { scheduleCreateErrorToast } from "@/services/schedules/schedule-create-error";
 import {
@@ -25,7 +28,6 @@ export function useScheduleAgentModal(
 ) {
   const { toast } = useToast();
   const queryClient = useQueryClient();
-  const userId = useAuthStore((state) => state.user?.id);
 
   const defaultScheduleName = useMemo(() => `Run ${agent.name}`, [agent.name]);
   const [scheduleName, setScheduleName] = useState(defaultScheduleName);
@@ -36,7 +38,10 @@ export function useScheduleAgentModal(
   const createScheduleMutation = useCreateSchedule({
     mutation: {
       onSuccess: (response, create) => {
-        forgetScheduleCreateKey({ userId, create });
+        forgetScheduleCreateKey({
+          userId: useAuthStore.getState().user?.id,
+          create,
+        });
         if (response.status === 200) {
           toast({
             title: "Schedule created",
@@ -50,9 +55,18 @@ export function useScheduleAgentModal(
         }
       },
       onError: (error: unknown, create) => {
-        forgetScheduleCreateKey({ userId, create, error });
+        forgetScheduleCreateKey({
+          userId: useAuthStore.getState().user?.id,
+          create,
+          error,
+        });
+        // The toast sends the user to check their schedules, so refresh the
+        // lists here too: a still-fresh cached list can hide the schedule
+        // the first attempt made. The key is kept for a retry (see
+        // forgetScheduleCreateKey); a 409 or 403 drops it as final.
+        invalidateAllScheduleQueries(queryClient, agent.graph_id);
         toast({
-          title: "❌ Failed to create schedule",
+          title: "Failed to create schedule",
           variant: "destructive",
           ...scheduleCreateErrorToast(error),
         });
@@ -61,7 +75,7 @@ export function useScheduleAgentModal(
   });
 
   const handleSchedule = useCallback(
-    (scheduleName: string, cronExpression: string) => {
+    async (scheduleName: string, cronExpression: string) => {
       if (!scheduleName.trim()) {
         toast({
           title: "⚠️ Schedule name required",
@@ -70,6 +84,14 @@ export function useScheduleAgentModal(
         });
         return Promise.reject(new Error("Schedule name required"));
       }
+
+      // Don't send before the signed-in user's id has loaded: the key is
+      // hashed with it, and a create sent while it is undefined, then
+      // retried after it, uses another slot and can make a second schedule.
+      // This waits for loading to settle, not for an id — a failed session
+      // load settles with no user, and the create still goes through.
+      await waitForAuthSettled();
+      const userId = useAuthStore.getState().user?.id;
 
       return new Promise<void>((resolve, reject) => {
         createScheduleMutation.mutate(
@@ -100,7 +122,6 @@ export function useScheduleAgentModal(
       inputCredentials,
       createScheduleMutation,
       toast,
-      userId,
     ],
   );
 
