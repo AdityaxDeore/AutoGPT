@@ -2883,6 +2883,12 @@ _SCHEDULE_KEY_TAKEN = (
     "schedules before trying again."
 )
 
+# A deleted create key stays refused for this long, so a retry sent after
+# the delete still gets a 409 instead of making a second schedule. In
+# memory only: a restart, or another process, forgets it, and the key may
+# be reused after that.
+_DELETED_SCHEDULE_KEY_TTL_SECONDS = 24 * 3600
+
 
 def _as_json(args: dict[str, Any]) -> str:
     """*args* as JSON text with sorted keys, for comparing two creates: in
@@ -3019,6 +3025,10 @@ class Scheduler(AppService):
         # Test servers: jobs a real scheduler saved in the platform database
         # must not run in them, and their tests' schedules must not land there.
         self.throwaway_jobstores = throwaway_jobstores
+        # Create keys deleted with their schedule, as schedule id -> the
+        # monotonic time of the delete. A retry under one gets a 409, not a
+        # second schedule, until the entry ages out.
+        self._deleted_schedule_keys: dict[str, float] = {}
 
     @property
     def scheduler(self) -> BackgroundScheduler:
@@ -3672,9 +3682,9 @@ class Scheduler(AppService):
 
         *schedule_id* is the caller's key for this create, sent again with a
         retry, and becomes the schedule's id: a create sent again after its
-        answer was lost gets the schedule it made, not a second one. Nothing
-        is ever replaced; any other create under that id is refused with a
-        ``ConflictError``.
+        answer was lost gets the schedule it made, not a second one. This
+        create never replaces a job under its id; any other create under
+        that id is refused with a ``ConflictError``.
         """
         if schedule_id is not None:
             # A UUID, so it can't take the id of a system job sharing the
@@ -3759,15 +3769,27 @@ class Scheduler(AppService):
 
         A key names one create by one account. Anything else under it,
         another account's schedule included, is a ``ConflictError``: never
-        answered with, and never replaced.
+        answered with, and never replaced. A key whose schedule was deleted
+        is refused the same way, while the delete is remembered.
         """
         assert job_args.schedule_id is not None
+        # Deleted since: the job is gone, but a retry under its key must
+        # still get a 409, not a second schedule. The entry ages out after
+        # _DELETED_SCHEDULE_KEY_TTL_SECONDS; a restart forgets it sooner.
+        deleted_at = self._deleted_schedule_keys.get(job_args.schedule_id)
+        if deleted_at is not None:
+            if time.monotonic() - deleted_at < _DELETED_SCHEDULE_KEY_TTL_SECONDS:
+                raise ConflictError(_SCHEDULE_KEY_TAKEN)
+            del self._deleted_schedule_keys[job_args.schedule_id]
         job = self.scheduler.get_job(
             job_args.schedule_id, jobstore=Jobstores.EXECUTION.value
         )
         if job is None:
             return None
         info = _job_to_info(job)
+        # The comparison covers exactly the GraphExecutionJobArgs fields, so
+        # a new field, or a backfill of stored kwargs, turns retries sent
+        # while the old code is in flight into 409s.
         if not (
             isinstance(info, GraphExecutionJobInfo)
             and _as_json(
@@ -3780,6 +3802,11 @@ class Scheduler(AppService):
         ):
             raise ConflictError(_SCHEDULE_KEY_TAKEN)
         logger.info(f"Create of schedule {job.id} was sent again; answered with it")
+        # A replay answers the create without going through
+        # _persist_schedule, so the index row the persist would have written
+        # lands here: without it, a filtered listing misses the schedule
+        # until the next reconcile.
+        self._upsert_schedule_index_row(job.id, job_args)
         return info
 
     @expose
@@ -3949,6 +3976,11 @@ class Scheduler(AppService):
         logger.info(f"Deleting job {schedule_id} (kind={info.kind})")
         job.remove()
         self._delete_schedule_index_row(schedule_id)
+        if isinstance(info, GraphExecutionJobInfo):
+            # Remember the delete: a retry under this key, sent after the job
+            # is gone, gets a 409 instead of making a second schedule. In
+            # memory only, for _DELETED_SCHEDULE_KEY_TTL_SECONDS.
+            self._deleted_schedule_keys[schedule_id] = time.monotonic()
         # Invalidate the read cache so the deletion shows up immediately
         # on the next ``get_execution_schedules`` call.
         self._invalidate_jobs_cache()

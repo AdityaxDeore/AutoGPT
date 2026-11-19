@@ -12,6 +12,7 @@ its real jobstore, with the limit lowered.
 import json
 import pickle
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -138,7 +139,7 @@ async def test_a_different_create_under_a_used_key_is_a_conflict(
         assert (kept.id, kept.name, kept.cron, kept.timezone, kept.input_data) == (
             str(key),
             "Morning run",
-            "0 9 * * *",
+            "0 0 29 2 *",
             "UTC",
             INPUTS,
         )
@@ -206,6 +207,54 @@ def test_a_retried_create_is_answered_at_the_accounts_limit(
     # Answered from the stored schedule: not validated or recorded again.
     assert validated.await_count == 2
     assert recorded.call_count == 2
+
+
+def test_a_replayed_create_restores_its_index_row(scheduler: Scheduler):
+    """The replay answers without persisting, so the row the persist would
+    have written lands on the replay: a filtered listing misses the
+    schedule until the next reconcile without it."""
+    key = str(uuid.uuid4())
+    made = _add(scheduler, key)
+    index = scheduler._schedule_index
+    assert index is not None
+    assert made.id in index.all_job_ids()
+    # The row a failed persist left behind: dropped, as if it never landed.
+    index.delete_many([made.id])
+    assert made.id not in index.all_job_ids()
+
+    retried = _add(scheduler, key)
+
+    assert retried.id == made.id
+    assert made.id in index.all_job_ids()
+
+
+def test_a_create_retried_after_its_schedule_was_deleted_is_a_conflict(
+    scheduler: Scheduler,
+):
+    key = str(uuid.uuid4())
+    _add(scheduler, key)
+    scheduler.delete_graph_execution_schedule(key, "user-1")
+    assert _job_ids(scheduler) == []
+
+    with pytest.raises(ConflictError):
+        _add(scheduler, key)
+
+    assert _job_ids(scheduler) == []
+
+
+def test_a_deleted_key_may_be_reused_once_its_receipt_has_aged_out(
+    scheduler: Scheduler,
+):
+    key = str(uuid.uuid4())
+    _add(scheduler, key)
+    scheduler.delete_graph_execution_schedule(key, "user-1")
+    # The receipt is a day old: past its TTL, so the key is free again.
+    scheduler._deleted_schedule_keys[key] = time.monotonic() - 25 * 3600
+
+    remade = _add(scheduler, key)
+
+    assert remade.id == key
+    assert _job_ids(scheduler) == [key]
 
 
 def test_a_new_create_at_the_accounts_limit_is_refused(scheduler: Scheduler):
@@ -506,10 +555,14 @@ async def _an_api_key(user: User) -> AsyncIterator[APIKeyCredentials]:
 async def _create(
     user: User, graph: GraphModel, key: uuid.UUID, **change: Any
 ) -> GraphExecutionJobInfo:
-    """POST /graphs/{graph_id}/schedules, as the schedule dialogs send it."""
+    """POST /graphs/{graph_id}/schedules, as the schedule dialogs send it.
+
+    The cron fires on Feb 29, reachable but distant: a schedule the test
+    leaves behind must not fire while the run is still going.
+    """
     body: dict[str, Any] = {
         "name": "Morning run",
-        "cron": "0 9 * * *",
+        "cron": "0 0 29 2 *",
         "inputs": INPUTS,
         "graph_version": graph.version,
         "timezone": "UTC",
