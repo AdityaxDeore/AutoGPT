@@ -124,6 +124,7 @@ from backend.executor import schedule_events
 from backend.executor import utils as execution_utils
 from backend.executor.jobstore import WRITE_TIMEOUT, ResilientSQLAlchemyJobStore
 from backend.executor.schedule_index import ScheduleIndex, ScheduleIndexEntry
+from backend.executor.schedule_tombstones import ScheduleTombstones
 from backend.executor.scheduler_shutdown import StopSafeBackgroundScheduler
 from backend.integrations.creds_manager import IntegrationCredentialsManager
 from backend.monitoring import (
@@ -2884,10 +2885,12 @@ _SCHEDULE_KEY_TAKEN = (
 )
 
 # A deleted create key stays refused for this long, so a retry sent after
-# the delete still gets a 409 instead of making a second schedule. In
-# memory only: a restart, or another process, forgets it, and the key may
-# be reused after that.
-_DELETED_SCHEDULE_KEY_TTL_SECONDS = 24 * 3600
+# the delete still gets a 409 instead of making a second schedule. The
+# tombstone is a row in the jobstore database (see schedule_tombstones.py),
+# so it survives a restart and is visible to every replica; the frontend
+# key it answers lives in sessionStorage, which a tab closing already
+# bounds well inside this.
+_DELETED_SCHEDULE_KEY_TTL_SECONDS = 7 * 24 * 3600
 
 
 def _as_json(args: dict[str, Any]) -> str:
@@ -3015,6 +3018,15 @@ class Scheduler(AppService):
     _schedule_index: ScheduleIndex | None = None
     _schedule_index_ready: bool = False
     _schedule_index_failure_version: int = 0
+    # Durable record of schedules deleted under an idempotent create key.
+    # ``None`` (not set up) means the replay check cannot see a delete, so
+    # a retry after one may make a second schedule until the table exists.
+    _schedule_tombstones: ScheduleTombstones | None = None
+    # Serializes a delete's tombstone-write + job-remove against a
+    # replay's tombstone-check + job-lookup, so the two cannot interleave
+    # in this process. Across processes the table itself is the record,
+    # and the delete writes it before removing the job.
+    _schedule_tombstone_lock = threading.Lock()
     _throwaway_dir: tempfile.TemporaryDirectory | None = None
     _block_load_error: Exception | None = None
 
@@ -3025,10 +3037,6 @@ class Scheduler(AppService):
         # Test servers: jobs a real scheduler saved in the platform database
         # must not run in them, and their tests' schedules must not land there.
         self.throwaway_jobstores = throwaway_jobstores
-        # Create keys deleted with their schedule, as schedule id -> the
-        # monotonic time of the delete. A retry under one gets a 409, not a
-        # second schedule, until the entry ages out.
-        self._deleted_schedule_keys: dict[str, float] = {}
 
     @property
     def scheduler(self) -> BackgroundScheduler:
@@ -3102,6 +3110,20 @@ class Scheduler(AppService):
             logger.exception(
                 "Schedule index setup failed; filtered schedule reads fall back "
                 "to the full jobstore scan until the backfill retries it"
+            )
+
+        self._schedule_tombstones = ScheduleTombstones(
+            execution_engine, schema=db_schema
+        )
+        try:
+            self._schedule_tombstones.ensure_table()
+        except Exception:
+            # Two replicas racing create_all(), or a transient DB error. Keep
+            # the store so writes still go through once the table exists;
+            # every reconcile retries the setup.
+            logger.exception(
+                "Deleted-schedule tombstone setup failed; a retry after a "
+                "delete may make a second schedule until the table exists"
             )
 
         self._persistent_jobstores = {
@@ -3774,16 +3796,17 @@ class Scheduler(AppService):
         """
         assert job_args.schedule_id is not None
         # Deleted since: the job is gone, but a retry under its key must
-        # still get a 409, not a second schedule. The entry ages out after
-        # _DELETED_SCHEDULE_KEY_TTL_SECONDS; a restart forgets it sooner.
-        deleted_at = self._deleted_schedule_keys.get(job_args.schedule_id)
-        if deleted_at is not None:
-            if time.monotonic() - deleted_at < _DELETED_SCHEDULE_KEY_TTL_SECONDS:
+        # still get a 409, not a second schedule. The tombstone is a row in
+        # the jobstore database, so a restart or another replica remembers
+        # it; it ages out after _DELETED_SCHEDULE_KEY_TTL_SECONDS. The
+        # lock holds the check and the job lookup together, so a delete
+        # cannot write the tombstone and remove the job between them.
+        with self._schedule_tombstone_lock:
+            if self._schedule_key_is_deleted(job_args.schedule_id):
                 raise ConflictError(_SCHEDULE_KEY_TAKEN)
-            del self._deleted_schedule_keys[job_args.schedule_id]
-        job = self.scheduler.get_job(
-            job_args.schedule_id, jobstore=Jobstores.EXECUTION.value
-        )
+            job = self.scheduler.get_job(
+                job_args.schedule_id, jobstore=Jobstores.EXECUTION.value
+            )
         if job is None:
             return None
         info = _job_to_info(job)
@@ -3808,6 +3831,23 @@ class Scheduler(AppService):
         # until the next reconcile.
         self._upsert_schedule_index_row(job.id, job_args)
         return info
+
+    def _schedule_key_is_deleted(self, schedule_id: str) -> bool:
+        """Whether a live tombstone holds this key. A tombstone store that
+        is not set up, or a read that fails, answers False: the replay
+        falls back to the jobstore alone, as the index does on failure."""
+        tombstones = self._schedule_tombstones
+        if tombstones is None:
+            return False
+        try:
+            return tombstones.is_deleted(schedule_id)
+        except Exception:
+            logger.warning(
+                "Deleted-schedule tombstone read failed; answering the "
+                "retry from the jobstore alone",
+                exc_info=True,
+            )
+            return False
 
     @expose
     def add_copilot_turn_schedule(
@@ -3974,17 +4014,42 @@ class Scheduler(AppService):
         """
         job, info = self._authorized_job(schedule_id, user_id, action="delete")
         logger.info(f"Deleting job {schedule_id} (kind={info.kind})")
-        job.remove()
-        self._delete_schedule_index_row(schedule_id)
         if isinstance(info, GraphExecutionJobInfo):
-            # Remember the delete: a retry under this key, sent after the job
-            # is gone, gets a 409 instead of making a second schedule. In
-            # memory only, for _DELETED_SCHEDULE_KEY_TTL_SECONDS.
-            self._deleted_schedule_keys[schedule_id] = time.monotonic()
+            # The tombstone lands before the job goes: a retry that finds
+            # the job gone must find the tombstone already there, so it
+            # gets a 409 instead of making a second schedule. The lock
+            # holds the write and the remove together, so a replay cannot
+            # check between them.
+            with self._schedule_tombstone_lock:
+                self._record_deleted_schedule_key(schedule_id, user_id)
+                job.remove()
+        else:
+            job.remove()
+        self._delete_schedule_index_row(schedule_id)
         # Invalidate the read cache so the deletion shows up immediately
         # on the next ``get_execution_schedules`` call.
         self._invalidate_jobs_cache()
         return info
+
+    def _record_deleted_schedule_key(self, schedule_id: str, user_id: str) -> None:
+        """Remember a delete for _DELETED_SCHEDULE_KEY_TTL_SECONDS. A
+        write that fails is logged and the delete still goes through: the
+        job is gone either way, and a retry in the window may make a
+        second schedule until the table is back."""
+        tombstones = self._schedule_tombstones
+        if tombstones is None:
+            return
+        try:
+            tombstones.record(
+                schedule_id,
+                user_id,
+                ttl_seconds=_DELETED_SCHEDULE_KEY_TTL_SECONDS,
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to record the delete of schedule {schedule_id}; a "
+                "retry under its key may make a second schedule"
+            )
 
     @expose
     def update_graph_execution_schedule(
@@ -4436,6 +4501,20 @@ class Scheduler(AppService):
 
     def _reconcile_schedule_index(self) -> None:
         """Rebuild the index from a full jobstore scan (startup + daily)."""
+        # The tombstones share the cadence: repair the table and drop
+        # expired rows. Expiry is also enforced on every read, so a missed
+        # prune only leaves dead rows behind, never a live refusal.
+        tombstones = self._schedule_tombstones
+        if (
+            tombstones is not None
+            and self._scheduler is not None
+            and self._scheduler.running
+        ):
+            try:
+                tombstones.ensure_table()
+                tombstones.prune_expired()
+            except Exception:
+                logger.warning("Deleted-schedule tombstone prune failed", exc_info=True)
         index = self._schedule_index
         if index is None:
             return

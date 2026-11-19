@@ -12,11 +12,11 @@ its real jobstore, with the limit lowered.
 import json
 import pickle
 import threading
-import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -242,14 +242,66 @@ def test_a_create_retried_after_its_schedule_was_deleted_is_a_conflict(
     assert _job_ids(scheduler) == []
 
 
-def test_a_deleted_key_may_be_reused_once_its_receipt_has_aged_out(
+def test_a_create_retried_after_a_restart_still_gets_a_conflict(
+    scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch
+):
+    """The delete is remembered in the jobstore database, not in the
+    process: a scheduler rebuilt against the same database still refuses
+    a retry under the deleted key."""
+    key = str(uuid.uuid4())
+    _add(scheduler, key)
+    scheduler.delete_graph_execution_schedule(key, "user-1")
+    db_url = f"sqlite:///{scheduler._throwaway_dir.name}/jobs.sqlite"
+
+    restarted, saved_loop, saved_thread = _restart_scheduler_against(
+        db_url, monkeypatch
+    )
+    try:
+        with pytest.raises(ConflictError):
+            _add(restarted, key)
+        assert _job_ids(restarted) == []
+    finally:
+        _shutdown_restarted_scheduler(restarted, saved_loop, saved_thread)
+
+
+def test_a_deleted_key_is_still_refused_while_its_tombstone_lives(
     scheduler: Scheduler,
 ):
     key = str(uuid.uuid4())
     _add(scheduler, key)
     scheduler.delete_graph_execution_schedule(key, "user-1")
-    # The receipt is a day old: past its TTL, so the key is free again.
-    scheduler._deleted_schedule_keys[key] = time.monotonic() - 25 * 3600
+    # Six days old: inside the seven-day TTL, so the key is still dead.
+    tombstones = scheduler._schedule_tombstones
+    assert tombstones is not None
+    tombstones.record(
+        key,
+        "user-1",
+        ttl_seconds=scheduler_module._DELETED_SCHEDULE_KEY_TTL_SECONDS,
+        deleted_at=datetime.now(timezone.utc) - timedelta(days=6),
+    )
+
+    with pytest.raises(ConflictError):
+        _add(scheduler, key)
+
+    assert _job_ids(scheduler) == []
+
+
+def test_a_deleted_key_may_be_reused_once_its_tombstone_has_expired(
+    scheduler: Scheduler,
+):
+    key = str(uuid.uuid4())
+    _add(scheduler, key)
+    scheduler.delete_graph_execution_schedule(key, "user-1")
+    # The tombstone is eight days old: past its seven-day TTL, so the key
+    # is free again.
+    tombstones = scheduler._schedule_tombstones
+    assert tombstones is not None
+    tombstones.record(
+        key,
+        "user-1",
+        ttl_seconds=scheduler_module._DELETED_SCHEDULE_KEY_TTL_SECONDS,
+        deleted_at=datetime.now(timezone.utc) - timedelta(days=8),
+    )
 
     remade = _add(scheduler, key)
 
@@ -507,6 +559,46 @@ def _job_ids(scheduler: Scheduler) -> list[str]:
     return sorted(
         job.id for job in scheduler.scheduler.get_jobs(Jobstores.EXECUTION.value)
     )
+
+
+def _restart_scheduler_against(
+    db_url: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Scheduler, Any, Any]:
+    """A scheduler built against an existing jobstore database, as a
+    restart would: a new Scheduler object, same SQLite file. Returns the
+    restarted scheduler plus the first scheduler's event loop and thread,
+    so the caller can put them back when it shuts the restarted one down."""
+    saved_loop = scheduler_module._event_loop
+    saved_thread = scheduler_module._event_loop_thread
+    service = Scheduler(register_system_tasks=False, throwaway_jobstores=True)
+    monkeypatch.setattr(service, "_jobstore_database", lambda: (None, db_url))
+    with (
+        patch.object(scheduler_module, "load_dotenv"),
+        patch("backend.util.service.AppService.run_service"),
+        patch("backend.util.service.AppService.cleanup"),
+    ):
+        service.run_service()
+    service.scheduler.pause()
+    return service, saved_loop, saved_thread
+
+
+def _shutdown_restarted_scheduler(
+    restarted: Scheduler, saved_loop: Any, saved_thread: Any
+) -> None:
+    """Stop a scheduler built by ``_restart_scheduler_against`` and hand
+    the first scheduler's event loop back, so the fixture's teardown
+    closes the right one."""
+    restarted.scheduler.shutdown(wait=False)
+    loop = scheduler_module._event_loop
+    thread = scheduler_module._event_loop_thread
+    if loop is not None:
+        loop.call_soon_threadsafe(loop.stop)
+    if thread is not None:
+        thread.join(timeout=30)
+    if loop is not None:
+        loop.close()
+    scheduler_module._event_loop = saved_loop
+    scheduler_module._event_loop_thread = saved_thread
 
 
 async def _new_graph(
